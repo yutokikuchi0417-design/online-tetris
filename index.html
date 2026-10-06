@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Supabase オンライン対戦テトリス</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    * { box-sizing: border-box; touch-action: manipulation; }
+    body {
+      background: #111; color: #fff; font-family: sans-serif;
+      margin: 0; padding: 10px; display: flex; flex-direction: column; align-items: center;
+    }
+    h1 { margin: 5px 0; font-size: 1.2rem; }
+    #room-controls { margin-bottom: 10px; display: flex; gap: 5px; }
+    input, button { padding: 8px 12px; font-size: 1rem; border-radius: 4px; border: none; }
+    button { background: #3ecf8e; color: #111; font-weight: bold; cursor: pointer; }
+    button:active { opacity: 0.8; }
+    
+    .game-container {
+      display: flex; gap: 15px; justify-content: center; flex-wrap: wrap;
+    }
+    .board-box { text-align: center; }
+    canvas { background: #000; border: 2px solid #444; }
+
+    /* Touch Controls for iPad / Mobile */
+    .touch-controls {
+      display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+      margin-top: 15px; width: 100%; max-width: 300px;
+    }
+    .touch-btn {
+      background: #333; color: #fff; font-size: 1.2rem; padding: 15px 0;
+      border-radius: 8px; text-align: center; user-select: none;
+    }
+    .touch-btn:active { background: #555; }
+    .span-2 { grid-column: span 2; }
+  </style>
+</head>
+<body>
+
+  <h1>オンライン対戦テトリス</h1>
+  <div id="room-controls">
+    <input type="text" id="roomId" placeholder="部屋ID (例: room1)" value="room1">
+    <button id="joinBtn">入室</button>
+  </div>
+  <div id="status">部屋IDを入力して入室してください</div>
+
+  <div class="game-container">
+    <div class="board-box">
+      <div>自分</div>
+      <canvas id="localCanvas" width="200" height="400"></canvas>
+    </div>
+    <div class="board-box">
+      <div>相手</div>
+      <canvas id="remoteCanvas" width="200" height="400"></canvas>
+    </div>
+  </div>
+
+  <!-- iPad / タッチ操作用ボタン -->
+  <div class="touch-controls">
+    <div class="touch-btn" id="btnRotate">回転 ↻</div>
+    <div class="touch-btn" id="btnUp">落とす ⤓</div>
+    <div class="touch-btn" id="btnHold">―</div>
+    <div class="touch-btn" id="btnLeft">←</div>
+    <div class="touch-btn" id="btnDown">↓</div>
+    <div class="touch-btn" id="btnRight">→</div>
+  </div>
+
+<script>
+  // 1. Supabase 初期化 (ご自身の情報に置き換えてください)
+  const SUPABASE_URL = "YOUR_SUPABASE_URL";
+  const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+  const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+  // 定数と描画準備
+  const COLS = 10, ROWS = 20, BLOCK_SIZE = 20;
+  const localCanvas = document.getElementById('localCanvas');
+  const localCtx = localCanvas.getContext('2d');
+  const remoteCanvas = document.getElementById('remoteCanvas');
+  const remoteCtx = remoteCanvas.getContext('2d');
+
+  const SHAPES = [
+    [],
+    [[1,1,1,1]], // I
+    [[1,1],[1,1]], // O
+    [[0,1,1],[1,1,0]], // S
+    [[1,1,0],[0,1,1]], // Z
+    [[1,0,0],[1,1,1]], // J
+    [[0,0,1],[1,1,1]], // L
+    [[0,1,0],[1,1,1]]  // T
+  ];
+  const COLORS = [null, '#00f0f0', '#f0f000', '#00f000', '#f00000', '#0000f0', '#f0a000', '#a000f0'];
+
+  // ゲーム状態
+  let board = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+  let currentPiece = null;
+  let piecePos = { x: 0, y: 0 };
+  let gameInterval = null;
+  let channel = null;
+
+  // Supabase Channel 接続
+  document.getElementById('joinBtn').addEventListener('click', joinRoom);
+
+  function joinRoom() {
+    const roomId = document.getElementById('roomId').value.trim();
+    if (!roomId) return;
+
+    if (channel) supabase.removeChannel(channel);
+
+    document.getElementById('status').innerText = `部屋 [${roomId}] に接続中...`;
+
+    channel = supabase.channel(`room:${roomId}`, {
+      config: { broadcast: { self: false } }
+    });
+
+    // 相手の盤面更新データを受け取る
+    channel.on('broadcast', { event: 'state' }, ({ payload }) => {
+      drawBoard(remoteCtx, payload.board, payload.piece, payload.pos);
+    }).subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        document.getElementById('status').innerText = `部屋 [${roomId}] に入室しました！対戦可能です。`;
+        resetGame();
+      }
+    });
+  }
+
+  // 自分の状態を相手に送信
+  function sendState() {
+    if (!channel) return;
+    channel.send({
+      type: 'broadcast',
+      event: 'state',
+      payload: { board, piece: currentPiece, pos: piecePos }
+    });
+  }
+
+  // テトリス基本ロジック
+  function createPiece() {
+    const type = Math.floor(Math.random() * 7) + 1;
+    currentPiece = SHAPES[type];
+    piecePos = { x: Math.floor(COLS / 2) - Math.floor(currentPiece[0].length / 2), y: 0 };
+    if (collide(board, currentPiece, piecePos)) {
+      alert("Game Over!");
+      resetGame();
+    }
+  }
+
+  function collide(b, piece, pos) {
+    for (let r = 0; r < piece.length; r++) {
+      for (let c = 0; c < piece[r].length; c++) {
+        if (piece[r][c]) {
+          let newX = pos.x + c, newY = pos.y + r;
+          if (newX < 0 || newX >= COLS || newY >= ROWS) return true;
+          if (newY >= 0 && b[newY][newX]) return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function mergePiece() {
+    currentPiece.forEach((row, r) => {
+      row.forEach((value, c) => {
+        if (value) board[piecePos.y + r][piecePos.x + c] = value;
+      });
+    });
+  }
+
+  function clearLines() {
+    for (let r = ROWS - 1; r >= 0; r--) {
+      if (board[r].every(val => val !== 0)) {
+        board.splice(r, 1);
+        board.unshift(Array(COLS).fill(0));
+        r++;
+      }
+    }
+  }
+
+  function move(dx, dy) {
+    piecePos.x += dx;
+    piecePos.y += dy;
+    if (collide(board, currentPiece, piecePos)) {
+      piecePos.x -= dx;
+      piecePos.y -= dy;
+      if (dy > 0) {
+        mergePiece();
+        clearLines();
+        createPiece();
+      }
+    }
+    renderLocal();
+  }
+
+  function rotate() {
+    const rotated = currentPiece[0].map((_, i) => currentPiece.map(row => row[i]).reverse());
+    const oldPiece = currentPiece;
+    currentPiece = rotated;
+    if (collide(board, currentPiece, piecePos)) currentPiece = oldPiece;
+    renderLocal();
+  }
+
+  function hardDrop() {
+    while (!collide(board, currentPiece, { x: piecePos.x, y: piecePos.y + 1 })) {
+      piecePos.y++;
+    }
+    mergePiece();
+    clearLines();
+    createPiece();
+    renderLocal();
+  }
+
+  // 描画
+  function drawBoard(ctx, b, piece = null, pos = { x: 0, y: 0 }) {
+    ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+    
+    // 背景グリッド
+    ctx.strokeStyle = '#222';
+    for (let r = 0; r < ROWS; r++) {
+      for (let c = 0; c < COLS; c++) {
+        ctx.strokeRect(c * BLOCK_SIZE, r * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
+        if (b[r][c]) {
+          ctx.fillStyle = COLORS[b[r][c]];
+          ctx.fillRect(c * BLOCK_SIZE, r * BLOCK_SIZE, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+        }
+      }
+    }
+
+    // 落下中のブロック
+    if (piece) {
+      piece.forEach((row, r) => {
+        row.forEach((val, c) => {
+          if (val) {
+            ctx.fillStyle = COLORS[val];
+            ctx.fillRect((pos.x + c) * BLOCK_SIZE, (pos.y + r) * BLOCK_SIZE, BLOCK_SIZE - 1, BLOCK_SIZE - 1);
+          }
+        });
+      });
+    }
+  }
+
+  function renderLocal() {
+    drawBoard(localCtx, board, currentPiece, piecePos);
+    sendState();
+  }
+
+  function resetGame() {
+    board = Array.from({ length: ROWS }, () => Array(COLS).fill(0));
+    createPiece();
+    if (gameInterval) clearInterval(gameInterval);
+    gameInterval = setInterval(() => move(0, 1), 800);
+    renderLocal();
+  }
+
+  // 入力イベント（PCキーボード）
+  window.addEventListener('keydown', (e) => {
+    if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", " "].includes(e.key)) {
+      e.preventDefault(); // スクロール防止
+    }
+    if (e.key === 'ArrowLeft') move(-1, 0);
+    if (e.key === 'ArrowRight') move(1, 0);
+    if (e.key === 'ArrowDown') move(0, 1);
+    if (e.key === 'ArrowUp') rotate();
+    if (e.key === ' ') hardDrop();
+  });
+
+  // 入力イベント（iPad / タッチボタン）
+  const addTouch = (id, fn) => {
+    const el = document.getElementById(id);
+    el.addEventListener('touchstart', (e) => { e.preventDefault(); fn(); });
+    el.addEventListener('click', (e) => { e.preventDefault(); fn(); });
+  };
+  addTouch('btnLeft', () => move(-1, 0));
+  addTouch('btnRight', () => move(1, 0));
+  addTouch('btnDown', () => move(0, 1));
+  addTouch('btnRotate', () => rotate());
+  addTouch('btnUp', () => hardDrop());
+
+</script>
+</body>
+</html>
